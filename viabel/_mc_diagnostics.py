@@ -1,6 +1,6 @@
 import warnings
 
-import autograd.numpy as np
+import jax.numpy as np
 from scipy.fftpack import next_fast_len
 
 
