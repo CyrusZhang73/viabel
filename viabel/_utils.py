@@ -4,7 +4,7 @@ import shutil
 import time
 from hashlib import md5
 
-import autograd.numpy as np
+import jax.numpy as np
 import pystan
 
 
