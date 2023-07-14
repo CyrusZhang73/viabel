@@ -1,6 +1,5 @@
-import autograd.numpy as np
-from autograd.numpy import linalg
-from autograd.scipy import special, stats
+import jax.numpy as np
+from jax.scipy import special, stats, linalg
 
 
 # See: https://github.com/scipy/scipy/blob/master/scipy/stats/_multivariate.py
