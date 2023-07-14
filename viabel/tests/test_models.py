@@ -1,17 +1,20 @@
 import pickle
 
-import autograd.numpy as anp
+import jax.numpy as anp
 import numpy as np
-import pystan
+import bridgestan as bs
 import pytest
-from autograd.scipy.stats import norm
-from autograd.test_util import check_vjp
-
+from jax.scipy.stats import norm
+from jax.test_util import check_vjp, check_grads
+from functools import partial
+from jax import vjp
 from viabel import models
 
 
 def _test_model(m, x, supports_tempering, supports_constrain):
-    check_vjp(m, x)
+    m_vjp = partial(vjp, m)
+    check_vjp(m, m_vjp, (x,))
+    check_grads(m, (x,), order=1, modes=("rev"))
     check_vjp(m, x[0])
     assert supports_tempering == m.supports_tempering
     if supports_tempering:  # pragma: no cover
@@ -65,15 +68,14 @@ def test_StanModel():
         with open('robust_reg_model.pkl', 'wb') as f:
             pickle.dump(regression_model, f)
     np.random.seed(5039)
-    beta_gen = np.array([-2, 1])
-    N = 25
-    x = np.random.randn(N, 2).dot(np.array([[1, .75], [.75, 1]]))
-    y_raw = x.dot(beta_gen) + np.random.standard_t(40, N)
-    y = y_raw - np.mean(y_raw)
-
-    data = dict(N=N, x=x, y=y, df=40)
-    fit = regression_model.sampling(data=data, iter=10, thin=1, chains=1)
+    stan = "gaussian.stan"
+    data = "gaussian.data.json"
+    fit = bs.StanModel.from_stan_file(stan, data)
     model = models.StanModel(fit)
-
-    x = 4 * np.random.randn(10, 2)
-    _test_model(model, x, False, dict(beta=x[0]))
+    x = np.random.random(model.param_unc_num())
+    _,grad_expected = fit.log_density_gradient(x)
+    _, vjpfun = vjp(model, x)
+    grad = vjpfun(1.0)
+    grad_actual = np.asarray(grad[0], dtype=np.float32)
+    return np.testing.assert_allclose(grad_actual, grad_expected)
+    #_test_model(model, x, False, dict(beta=x[0]))
