@@ -1,16 +1,15 @@
 from abc import ABC, abstractmethod
 
-import autograd.numpy as np
-import autograd.numpy.random as npr
-import autograd.scipy.stats.norm as norm
-import autograd.scipy.stats.t as t_dist
+import jax.numpy as np
+import jax.random as npr
+import jax.scipy.stats.norm as norm
+import jax.scipy.stats.t as t_dist
 from autograd import elementwise_grad
-from autograd.scipy.linalg import sqrtm
 from paragami import (
     FlattenFunctionInput, NumericArrayPattern, NumericVectorPattern, PatternDict,
     PSDSymmetricMatrixPattern)
-
-from ._distributions import multivariate_t_logpdf
+from scipy.sparse.linalg import LinearOperator, eigsh
+from _distributions import multivariate_t_logpdf
 
 __all__ = [
     'ApproximationFamily',
@@ -19,7 +18,8 @@ __all__ = [
     'MultivariateT',
     'NeuralNet',
     'NVPFlow',
-    'LRGaussian'
+    'LRGaussian',
+    'MultivariateGaussian'
 ]
 
 
@@ -200,7 +200,8 @@ class MFGaussian(ApproximationFamily):
         dim : `int`
             dimension of the underlying parameter space
         """
-        self._rs = npr.RandomState(seed)
+        self._key = npr.PRNGKey(seed)
+
         self._pattern = _get_mu_log_sigma_pattern(dim)
         super().__init__(dim, self._pattern.flat_length(True), True, True)
 
@@ -210,10 +211,10 @@ class MFGaussian(ApproximationFamily):
         return self._pattern.flatten(init_param_dict)
 
     def sample(self, var_param, n_samples, seed=None):
-        my_rs = self._rs if seed is None else npr.RandomState(seed)
+        my_key = self._key if seed is None else npr.PRNGKey(seed)
         param_dict = self._pattern.fold(var_param)
         return param_dict['mu'] + np.exp(param_dict['log_sigma']) * \
-            my_rs.randn(n_samples, self.dim)
+            npr.normal(my_key, shape=(n_samples, self.dim))
 
     def _entropy(self, var_param):
         param_dict = self._pattern.fold(var_param)
@@ -258,7 +259,7 @@ class MFStudentT(ApproximationFamily):
         if df <= 2:
             raise ValueError('df must be greater than 2')
         self._df = df
-        self._rs = npr.RandomState(seed)
+        self._rs = npr.PRNGKey(seed)
         self._pattern = _get_mu_log_sigma_pattern(dim)
         super().__init__(dim, self._pattern.flat_length(True), True, False)
 
@@ -268,7 +269,7 @@ class MFStudentT(ApproximationFamily):
         return self._pattern.flatten(init_param_dict)
 
     def sample(self, var_param, n_samples, seed=None):
-        my_rs = self._rs if seed is None else npr.RandomState(seed)
+        my_rs = self._rs if seed is None else npr.PRNGKey(seed)
         param_dict = self._pattern.fold(var_param)
         return param_dict['mu'] + np.exp(param_dict['log_sigma']) * \
             my_rs.standard_t(self.df, size=(n_samples, self.dim))
@@ -326,7 +327,7 @@ class MultivariateT(ApproximationFamily):
         if df <= 2:
             raise ValueError('df must be greater than 2')
         self._df = df
-        self._rs = npr.RandomState(seed)
+        self._rs = npr.PRNGKey(seed)
         self._pattern = _get_mu_sigma_pattern(dim)
         self._log_density = FlattenFunctionInput(
             lambda param_dict, x: multivariate_t_logpdf(
@@ -340,7 +341,7 @@ class MultivariateT(ApproximationFamily):
         return self._pattern.flatten(init_param_dict)
 
     def sample(self, var_param, n_samples, seed=None):
-        my_rs = self._rs if seed is None else npr.RandomState(seed)
+        my_rs = self._rs if seed is None else npr.PRNGKey(seed)
         df = self.df
         s = np.sqrt(my_rs.chisquare(df, n_samples) / df)
         param_dict = self._pattern.fold(var_param)
@@ -404,7 +405,7 @@ class NeuralNet(ApproximationFamily):
         self._layers = len(layers_shapes)
         self._nonlinearity = nonlinearity
         self._last = last
-        self._rs = npr.RandomState(seed)
+        self._rs = npr.PRNGKey(seed)
         self.input_dim = layers_shapes[0][0]
         for layer_id in range(len(layers_shapes)):
             self._pattern[str(layer_id)] = NumericArrayPattern(shape=layers_shapes[layer_id])
@@ -548,7 +549,8 @@ class NVPFlow(ApproximationFamily):
 
     def supports_pth_moment(self, p):
         return False
-    
+
+
 def _get_low_rank_mu_sigma_pattern(dim, k):
     ms_pattern = PatternDict(free_default=True)
     ms_pattern['mu'] = NumericVectorPattern(length=dim)
@@ -571,24 +573,31 @@ def _get_log_determinant(D, B):
     log_det_M = log_det_D + log_det_IpDBBT
     return log_det_M
 
+
 def _get_trace(D0, B0, D1, B1):
     """Compute the trace of the product of the inverse of B1 @ B1.T + np.diag(D1) and B0 @ B0.T + np.diag(D0).
 
     Parameters
     ----------
-    D0 : `numpy vector`
+    D0 : `numpy array`
         Diagonal elements of sigma0.
-    B0 : `numpy vector`
+    B0 : `numpy array`
         Low-rank component of sigma0.
     D1 : `numpy array`
         Diagonal elements of sigma1.
     B1 : `numpy array`
         Low-rank component of sigma1.
     """
-    
+    # Compute term inside inverse
     I_B1D1B1 = np.eye(B1.shape[1]) + B1.T / D1 @ B1
+
+    # Compute product D1^-1 * B1
     invD1_B1 = B1 / D1[:, np.newaxis]
+
+    # Compute product D1^-1 * B1 * (I + B1^T * D1^-1 * B1)^-1
     invD1_B1_I_B1D1B1_inv = np.linalg.solve(I_B1D1B1.T, invD1_B1.T).T
+
+    # Compute product D1^-1 * B1 * (I + B1^T * D1^-1 * B1)^-1 * B1^T * D1^-1
     product = invD1_B1_I_B1D1B1_inv @ (B1.T / D1)
 
     # Compute Tr(D0 * B1 * (I + B1^T * D1^-1 * B1)^-1 * B1^T * D1^-1)
@@ -605,6 +614,7 @@ def _get_trace(D0, B0, D1, B1):
 
     # Return Tr(sigma0 * sigma1^-1) = Tr(D0 * D1^-1) + Tr(np.diag(D1)^(-1) * B0 @ B0.T) - Tr(D0 * np.diag(D1)^(-1) * B1 * (I + B1^T * D1^-1 * B1)^-1 * B1^T * D1^-1) - Tr(np.diag(D1)^(-1) * B1 * (I + B1.T * D1^-1 * B1)^-1 * B1^T * D1^-1 * B0 @ B0.T)
     return trace_D0_invD1 + trace_invD1_B0B0T - trace_product - trace_extra_term
+
 
 
 class LRGaussian(ApproximationFamily):
@@ -726,6 +736,97 @@ class LRGaussian(ApproximationFamily):
         else:  # p == 4
             return 2 * np.sum(eigvals ** 2) + np.sum(eigvals) ** 2
 
+    '''def _pth_moment(self, var_param, p):
+        param_dict = self._pattern.fold(var_param)
+        D_exp = np.exp(2 * param_dict['log_sigma'])
+        B = param_dict['low_rank']
+
+        def matrix_vector_product(v, B, D):
+            return B @ (B.T @ v) + D * v
+
+        # Create a linear operator that represents the matrix
+        op = LinearOperator((self.dim, self.dim), matvec=lambda v: matrix_vector_product(v, B, D_exp))
+
+        # Find the largest k eigenvalues
+        k = min(self.dim, 10)
+        eigvals, _ = eigsh(op, k)
+        if p == 2:
+            return np.sum(eigvals)
+        else:  # p == 4
+            return 2 * np.sum(eigvals ** 2) + np.sum(eigvals) ** 2'''
+
+    def supports_pth_moment(self, p):
+        return p in [2, 4]
+
+
+def _get_mu_sigma_pattern(dim):
+    ms_pattern = PatternDict(free_default=True)
+    ms_pattern['mu'] = NumericVectorPattern(length=dim)
+    ms_pattern['Sigma'] = PSDSymmetricMatrixPattern(size=dim)
+    return ms_pattern
+
+
+def sigma_psd(Sigma, dim, eps=0):
+    return Sigma + eps * np.eye(dim)
+
+def sqrtm(matrix):
+    _, v = jnp.linalg.eigh(matrix)
+    sqrt_matrix = jnp.dot(v, jnp.dot(jnp.diag(jnp.sqrt(jnp.abs(_))), jnp.linalg.inv(v)))
+    return sqrt_matrix
+class MultivariateGaussian(ApproximationFamily):
+    """A full-rank multivariate Gaussian approximation family."""
+
+    def __init__(self, dim, eps=0, seed=1):
+        self.eps = eps
+        self._rs = npr.RandomState(seed)
+        self._pattern = _get_mu_sigma_pattern(dim)
+        super().__init__(dim, self._pattern.flat_length(True), True, True)
+
+    def init_param(self):
+        Sigma = sigma_psd(10 * np.eye(self.dim), self.dim, self.eps)
+        init_param_dict = dict(mu=np.zeros(self.dim),
+                               Sigma=Sigma)
+        return self._pattern.flatten(init_param_dict)
+
+    def sample(self, var_param, n_samples, seed=None):
+        my_rs = self._rs if seed is None else npr.RandomState(seed)
+        param_dict = self._pattern.fold(var_param)
+        z = my_rs.randn(n_samples, self.dim)
+        sqrtSigma = sqrtm(sigma_psd(param_dict['Sigma'], self.dim, self.eps))
+        return param_dict['mu'] + np.dot(z, sqrtSigma)
+
+    def entropy(self, var_param):
+        # ignore terms that depend only on number of dimensions
+        param_dict = self._pattern.fold(var_param)
+        return 0.5 * self.dim * (1.0 + np.log(2 * np.pi)) + .5 * np.log(
+            np.linalg.det(sigma_psd(param_dict['Sigma'], self.dim, self.eps)))
+
+    def _kl(self, var_param0, var_param1):
+        param_dict0 = self._pattern.fold(var_param0)
+        param_dict1 = self._pattern.fold(var_param1)
+        mean_diff = param_dict1['mu'] - param_dict0['mu']
+        log_det_var_diff = np.log(np.linalg.det(sigma_psd(param_dict1['Sigma'], self.dim, self.eps))) - \
+                           np.log(np.linalg.det(sigma_psd(param_dict0['Sigma'], self.dim, self.eps)))
+        inv_var1 = np.linalg.inv(sigma_psd(param_dict1['Sigma'], self.dim, self.eps))
+        return 0.5 * (log_det_var_diff + np.trace(
+            np.matmul(inv_var1, sigma_psd(param_dict0['Sigma'], self.dim, self.eps))) + \
+                      np.matmul(np.matmul(mean_diff.T, inv_var1), mean_diff) - self.dim)
+
+    def log_density(self, var_param, x):
+        param_dict = self._pattern.fold(var_param)
+        return mvn.logpdf(x, param_dict['mu'], sigma_psd(param_dict['Sigma'], self.dim, self.eps))
+
+    def mean_and_cov(self, var_param):
+        param_dict = self._pattern.fold(var_param)
+        return param_dict['mu'], sigma_psd(param_dict['Sigma'], self.dim, self.eps)
+
+    def _pth_moment(self, var_param, p):
+        param_dict = self._pattern.fold(var_param)
+        sq_scales = np.linalg.eigvalsh(sigma_psd(param_dict['Sigma'], self.dim, self.eps))
+        if p == 2:
+            return np.sum(sq_scales)
+        else:  # p == 4
+            return 2 * np.sum(sq_scales ** 2) + np.sum(sq_scales) ** 2
 
     def supports_pth_moment(self, p):
         return p in [2, 4]
